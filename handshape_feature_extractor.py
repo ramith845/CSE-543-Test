@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import os
 
-import tf_keras as keras
+import keras
 load_model = keras.models.load_model
 Model = keras.models.Model
 
@@ -25,7 +25,7 @@ class HandShapeFeatureExtractor:
         if HandShapeFeatureExtractor.__single is None:
             try:
                 # Load the model (Ensure the model file exists)
-                model_path = os.path.join(BASE, 'gestures_trained_cnn_model.h5')
+                model_path = os.path.join(BASE, 'gestures_trained_cnn_model.keras')
                 if not os.path.exists(model_path):
                     raise FileNotFoundError(f"⚠️ Model file not found: {model_path}")
 

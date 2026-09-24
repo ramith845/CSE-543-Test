@@ -3,11 +3,11 @@ import numpy as np
 import csv
 import os
 import tensorflow as tf
-from tf_keras.models import load_model
+from keras.models import load_model
 from scipy.spatial.distance import cosine
 
 # Load the model
-model_path = "gestures_trained_cnn_model.h5"
+model_path = "gestures_trained_cnn_model.keras"
 if not os.path.exists(model_path):
     raise FileNotFoundError(f"❌ Error: Model file '{model_path}' not found!")
 
