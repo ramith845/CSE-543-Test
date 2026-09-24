@@ -21,8 +21,10 @@ gesture_mapping = {
     "LightOff": 14, "LightOn": 15, "SetThermo": 16
 }
 
-# Dictionary to store training features
-training_features = {}
+training_labels = []
+training_vectors = []
+
+FRAME_POSITIONS = (0.25, 0.5, 0.75)
 
 class HandShapeFeatureExtractor:
     __single = None
@@ -45,6 +47,8 @@ class HandShapeFeatureExtractor:
 
     def extract_feature(self, image):
         try:
+            # The model was trained on RGB; OpenCV decodes frames as BGR.
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             resized_frame = cv2.resize(image, (300, 300))
             normalized_frame = resized_frame / 255.0
             input_frame = np.expand_dims(normalized_frame, axis=0)
@@ -70,17 +74,21 @@ def process_video(video_path):
         return None
     
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    middle_frame_idx = frame_count // 2  
-    
-    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_idx)
-    ret, frame = cap.read()
+    features = []
+    for position in FRAME_POSITIONS:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, min(frame_count - 1, int(frame_count * position)))
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            feature = extract_features(frame)
+            if feature is not None:
+                features.append(feature)
     cap.release()
-    
-    if not ret or frame is None:
-        print(f"⚠️ Skipping {video_path}: Cannot read middle frame.")
+
+    if not features:
+        print(f"⚠️ Skipping {video_path}: Cannot read frames.")
         return None
-    
-    return extract_features(frame)
+
+    return np.mean(features, axis=0)
 
 # Load training video features from 'traindata/'
 def load_training_features(folder_path):
@@ -89,7 +97,7 @@ def load_training_features(folder_path):
         return
 
     print(f"✅ Loading gesture features from {folder_path}...")
-    for video_file in os.listdir(folder_path):
+    for video_file in sorted(os.listdir(folder_path)):
         video_path = os.path.join(folder_path, video_file)
         features = process_video(video_path)
 
@@ -106,15 +114,21 @@ def load_training_features(folder_path):
                 print(f"⚠️ Warning: Unrecognized gesture {video_file}, skipping...")
                 continue
 
-            training_features[label] = features
+            training_labels.append(label)
+            training_vectors.append(features)
 
 # Load training gestures
 load_training_features("traindata")
 
-if not training_features:
+if not training_vectors:
     raise ValueError("❌ Error: No valid training features extracted!")
 
-print(f"✅ Loaded {len(training_features)} training gestures.")
+# Centring on the training mean removes the bias every frame shares, so cosine
+# similarity compares what differs between gestures.
+feature_mean = np.mean(training_vectors, axis=0)
+training_vectors = [vector - feature_mean for vector in training_vectors]
+
+print(f"✅ Loaded {len(training_vectors)} training videos.")
 
 # Process test videos
 test_data_path = "test"
@@ -124,25 +138,23 @@ if not os.path.exists(test_data_path) or not os.listdir(test_data_path):
 
 print("✅ Processing test videos...")
 recognized_gestures = []
-test_videos = [f for f in os.listdir(test_data_path) if f.endswith(".mp4")]
+test_videos = sorted(f for f in os.listdir(test_data_path) if f.endswith(".mp4"))
 
 for test_video in test_videos:
     test_video_path = os.path.join(test_data_path, test_video)
     test_features = process_video(test_video_path)
     if test_features is None:
         continue
-    
+    test_features = test_features - feature_mean
+
     best_match = None
     best_score = float("inf")
-    
-    for train_label, train_features in training_features.items():
-        similarity_score = cosine(test_features, train_features)  
 
-        # 🔍 Print similarity for debugging
-        print(f"🔍 Comparing with gesture {train_label} -> Cosine Similarity: {similarity_score:.5f}")
+    for train_label, train_features in zip(training_labels, training_vectors):
+        distance = cosine(test_features, train_features)
 
-        if similarity_score < best_score:
-            best_score = similarity_score
+        if distance < best_score:
+            best_score = distance
             best_match = train_label
     
     recognized_gestures.append(best_match)

@@ -50,6 +50,10 @@ class HandShapeFeatureExtractor:
                 print("⚠️ Warning: Received an empty frame for processing.")
                 return None  # Skip processing
 
+            # The model was trained on RGB; OpenCV decodes frames as BGR.
+            if crop.ndim == 3:
+                crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
             # Resize the image to 300x300
             img = cv2.resize(crop, (300, 300))
 
