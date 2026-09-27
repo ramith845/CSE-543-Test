@@ -1,170 +1,195 @@
-import cv2
-import numpy as np
-import csv
-import os
-import tensorflow as tf
-from keras.models import load_model
-from scipy.spatial.distance import cosine
+"""
+main.py  -  CSE 535 SmartHome Gesture Control, Project Part 2
+=============================================================
+Recognises which of 17 hand gestures each test video shows, and writes the
+answers to Results.csv (one number per line, no header). The autograder runs
+only this file.
 
-# Load the model
-model_path = "gestures_trained_cnn_model.keras"
-if not os.path.exists(model_path):
-    raise FileNotFoundError(f"❌ Error: Model file '{model_path}' not found!")
+How it works
+------------
+1. Every video is turned into ONE feature vector:
+      read 3 frames (at 25%, 50%, 75% of the video)
+      -> run each frame through the CNN (handshape_feature_extractor.py)
+      -> average the 3 outputs.
+2. Do that for every training video (traindata/) and every test video (test/).
+3. Subtract the average training vector from all vectors ("centring"), so the
+   comparison focuses on what differs between gestures.
+4. For each test video, find the training video whose vector is closest by
+   cosine distance. That training video's gesture label is the prediction.
+5. Write the predictions to Results.csv in sorted test-filename order.
+"""
 
-model = load_model(model_path)
-print("✅ Model loaded successfully!")
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
+import csv                                    # writes Results.csv
+import os                                     # lists folders, splits file names
 
-# Predefined mapping for gesture labels
-gesture_mapping = {
-    "0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
-    "DecreaseFanSpeed": 10, "FanOff": 11, "FanOn": 12, "IncreaseFanSpeed": 13,
-    "LightOff": 14, "LightOn": 15, "SetThermo": 16
-}
+import cv2                                    # OpenCV: opens videos and reads frames
+import numpy as np                            # averages / subtracts feature vectors
+from scipy.spatial.distance import cosine     # cosine distance: 0 = same direction, 2 = opposite
 
-training_labels = []
-training_vectors = []
+from handshape_feature_extractor import HandShapeFeatureExtractor   # loads and runs the CNN
 
+# import tensorflow as tf                     # NOT USED: keras is imported inside the extractor
+# from keras.models import load_model         # NOT USED: the extractor loads the model
+
+# model = load_model(model_path)              # NOT USED: loaded the model a second time;
+# print("Model loaded successfully!")         # the extractor below already loads it once
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+TRAIN_DIR = "traindata"          # labelled training videos (the file name holds the label)
+TEST_DIR = "test"                # videos to classify (filled in by the autograder)
+RESULTS_FILE = "Results.csv"     # output: one predicted label per test video
+
+# Where in each video to grab frames (fraction of the video's length).
+# Averaging 3 frames is more reliable than using only the middle frame.
 FRAME_POSITIONS = (0.25, 0.5, 0.75)
 
-class HandShapeFeatureExtractor:
-    __single = None
+# Gesture name (as it appears at the end of a file name) -> numeric label
+# required by the assignment.
+GESTURE_MAPPING = {
+    "0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+    "DecreaseFanSpeed": 10, "FanOff": 11, "FanOn": 12, "IncreaseFanSpeed": 13,
+    "LightOff": 14, "LightOn": 15, "SetThermo": 16,
+}
 
-    @staticmethod
-    def get_instance():
-        if HandShapeFeatureExtractor.__single is None:
-            HandShapeFeatureExtractor()
-        return HandShapeFeatureExtractor.__single
 
-    def __init__(self):
-        if HandShapeFeatureExtractor.__single is None:
-            try:
-                self.model = load_model(model_path)
-                HandShapeFeatureExtractor.__single = self
-                print("✅ Model loaded successfully!")
-            except Exception as e:
-                print(f"❌ Error loading model: {str(e)}")
-                raise
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def gesture_label_from_filename(video_file):
+    """Read the gesture label from a file name, e.g. "T1-H-FanOn.mp4" -> 12.
 
-    def extract_feature(self, image):
-        try:
-            # The model was trained on RGB; OpenCV decodes frames as BGR.
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            resized_frame = cv2.resize(image, (300, 300))
-            normalized_frame = resized_frame / 255.0
-            input_frame = np.expand_dims(normalized_frame, axis=0)
-            return self.model.predict(input_frame).flatten()
-        except Exception as e:
-            print(f"❌ Error extracting features: {str(e)}")
-            return None
+    Returns -1 if the name isn't recognised. Only understands the "...-<Gesture>.mp4"
+    naming used by the course videos, not the Part 1 app's
+    "FanDown_PRACTICE_1_Name.mp4" naming.
+    """
+    name = os.path.splitext(video_file)[0]        # drop the extension: "T1-H-FanOn"
+    gesture = name.split("-")[-1]                  # keep the part after the last "-": "FanOn"
+    if "Decerease" in gesture:                     # one course file name has this typo
+        gesture = "DecreaseFanSpeed"
+    return GESTURE_MAPPING.get(gesture, -1)        # look up the number; -1 if unknown
 
-# Function to extract features using CNN model
-def extract_features(frame):
-    extractor = HandShapeFeatureExtractor.get_instance()
-    return extractor.extract_feature(frame)
 
-# Function to process videos and extract middle frame
-def process_video(video_path):
-    if not os.path.exists(video_path):
-        print(f"❌ Error: Video file '{video_path}' not found!")
-        return None
-    
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"❌ Error: Cannot open video {video_path}")
-        return None
-    
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    features = []
+def video_feature(video_path, extractor):
+    """Turn one video into one feature vector (the average of 3 frames' CNN outputs).
+
+    Returns None if no frame could be read or processed.
+    """
+    # if not os.path.exists(video_path):          # NOT NEEDED: paths come from os.listdir,
+    #     return None                             # so they always exist
+
+    cap = cv2.VideoCapture(video_path)                         # open the video file
+    if not cap.isOpened():                                     # not a readable video
+        return None                                            # (e.g. a stray .gitkeep file)
+
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))       # total number of frames
+
+    frame_features = []                                        # one CNN output per frame
     for position in FRAME_POSITIONS:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, min(frame_count - 1, int(frame_count * position)))
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            feature = extract_features(frame)
+        frame_index = min(frame_count - 1, int(frame_count * position))  # e.g. 25% -> frame 30 of 120
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)          # jump to that frame
+        ok, frame = cap.read()                                 # read it (BGR image)
+        if ok and frame is not None:
+            feature = extractor.extract_feature(frame)         # CNN output, shape (1, 27)
             if feature is not None:
-                features.append(feature)
-    cap.release()
+                frame_features.append(feature.flatten())       # store as a flat 27-number vector
+    cap.release()                                              # close the video file
 
-    if not features:
-        print(f"⚠️ Skipping {video_path}: Cannot read frames.")
+    if not frame_features:                                     # every frame failed
         return None
+    return np.mean(frame_features, axis=0)                     # average the 3 vectors into 1
 
-    return np.mean(features, axis=0)
 
-# Load training video features from 'traindata/'
-def load_training_features(folder_path):
-    if not os.path.exists(folder_path) or not os.listdir(folder_path):
-        print(f"⚠️ Warning: No videos found in '{folder_path}/' folder!")
+def load_training_set(extractor):
+    """Build (labels, vectors) from every video in traindata/, one entry per video."""
+    labels, vectors = [], []
+
+    # if not os.listdir(TRAIN_DIR):                            # NOT NEEDED: an empty folder
+    #     print("No videos found in traindata/")               # already fails with the error below
+
+    for video_file in sorted(os.listdir(TRAIN_DIR)):           # sorted = same order on every machine
+        vector = video_feature(os.path.join(TRAIN_DIR, video_file), extractor)
+        if vector is None:
+            print(f"Skipping training file {video_file}: could not read frames.")
+            continue
+
+        label = gesture_label_from_filename(video_file)
+        if label == -1:
+            print(f"Skipping training file {video_file}: unrecognised gesture name.")
+            continue
+
+        labels.append(label)          # keep every video (3 takes of a gesture = 3 entries)
+        vectors.append(vector)
+
+    if not vectors:
+        raise ValueError("No valid training videos found in traindata/.")
+    return labels, vectors
+
+
+def nearest_label(test_vector, train_labels, train_vectors):
+    """Return the label of the training vector with the smallest cosine distance."""
+    best_label = None
+    best_distance = float("inf")                               # start with "infinitely far"
+    for label, train_vector in zip(train_labels, train_vectors):
+        distance = cosine(test_vector, train_vector)           # 0 = most similar
+        if distance < best_distance:                           # closer than anything so far?
+            best_distance = distance
+            best_label = label
+    return best_label
+
+
+# ---------------------------------------------------------------------------
+# Main program
+# ---------------------------------------------------------------------------
+def main():
+    # Load the CNN once; every frame of every video goes through this object.
+    extractor = HandShapeFeatureExtractor.get_instance()
+
+    # Steps 1-2 (training side): one averaged vector per training video.
+    train_labels, train_vectors = load_training_set(extractor)
+    # print(f"Loaded {len(train_vectors)} training videos.")  # progress message only
+
+    # Step 3: centre everything on the average training vector. Every frame
+    # shares a common component (similar backgrounds, lighting); removing it
+    # lets cosine distance compare the parts that differ between gestures.
+    feature_mean = np.mean(train_vectors, axis=0)
+    train_vectors = [vector - feature_mean for vector in train_vectors]
+
+    # Test videos, sorted so Results.csv rows line up with the grader's answer order.
+    test_videos = sorted(f for f in os.listdir(TEST_DIR) if f.endswith(".mp4"))
+    if not test_videos:
+        # print("No test videos found in test/.")             # progress message only
         return
 
-    print(f"✅ Loading gesture features from {folder_path}...")
-    for video_file in sorted(os.listdir(folder_path)):
-        video_path = os.path.join(folder_path, video_file)
-        features = process_video(video_path)
+    # Steps 2 and 4 (test side): vector per test video -> closest training label.
+    predictions = []
+    for test_video in test_videos:
+        test_vector = video_feature(os.path.join(TEST_DIR, test_video), extractor)
+        if test_vector is None:
+            # Skipping a test video shifts every later row up by one, so rows no
+            # longer line up with the grader's answers. Only happens for unreadable videos.
+            print(f"Skipping test file {test_video}: could not read frames.")
+            continue
+        test_vector = test_vector - feature_mean                # same centring as training
 
-        if features is not None:
-            file_name = os.path.splitext(video_file)[0]  
-            parts = file_name.split("-")  
-            gesture_name = parts[-1]  
+        label = nearest_label(test_vector, train_labels, train_vectors)
+        predictions.append(label)
+        # print(f"Recognized {test_video} as gesture {label}")  # progress message only
 
-            if "Decerease" in gesture_name:
-                gesture_name = "DecreaseFanSpeed"
+    # Step 5: one label per line, no header (the format the autograder expects).
+    with open(RESULTS_FILE, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        for label in predictions:
+            writer.writerow([label])
+    # print(f"Results saved to {RESULTS_FILE}.")               # progress message only
 
-            label = gesture_mapping.get(gesture_name, -1)  
-            if label == -1:
-                print(f"⚠️ Warning: Unrecognized gesture {video_file}, skipping...")
-                continue
 
-            training_labels.append(label)
-            training_vectors.append(features)
-
-# Load training gestures
-load_training_features("traindata")
-
-if not training_vectors:
-    raise ValueError("❌ Error: No valid training features extracted!")
-
-# Centring on the training mean removes the bias every frame shares, so cosine
-# similarity compares what differs between gestures.
-feature_mean = np.mean(training_vectors, axis=0)
-training_vectors = [vector - feature_mean for vector in training_vectors]
-
-print(f"✅ Loaded {len(training_vectors)} training videos.")
-
-# Process test videos
-test_data_path = "test"
-if not os.path.exists(test_data_path) or not os.listdir(test_data_path):
-    print("⚠️ No test videos found in 'test/' folder! Skipping recognition.")
-    exit()
-
-print("✅ Processing test videos...")
-recognized_gestures = []
-test_videos = sorted(f for f in os.listdir(test_data_path) if f.endswith(".mp4"))
-
-for test_video in test_videos:
-    test_video_path = os.path.join(test_data_path, test_video)
-    test_features = process_video(test_video_path)
-    if test_features is None:
-        continue
-    test_features = test_features - feature_mean
-
-    best_match = None
-    best_score = float("inf")
-
-    for train_label, train_features in zip(training_labels, training_vectors):
-        distance = cosine(test_features, train_features)
-
-        if distance < best_score:
-            best_score = distance
-            best_match = train_label
-    
-    recognized_gestures.append(best_match)
-    print(f"✅ Recognized {test_video} as gesture {best_match} (Score: {best_score:.5f})")
-
-# Save results in required format (51x1 matrix, no headers)
-output_file = "Results.csv"
-with open(output_file, mode="w", newline="") as file:
-    writer = csv.writer(file)
-    for recognized_gesture in recognized_gestures:
-        writer.writerow([recognized_gesture])  
-
-print(f"🎉 Gesture recognition complete. Results saved to {output_file}.")
+# Run main() only when this file is executed directly (python main.py),
+# not when another file imports it.
+if __name__ == "__main__":
+    main()
